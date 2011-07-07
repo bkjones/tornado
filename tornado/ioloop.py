@@ -14,13 +14,24 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""A level-triggered I/O loop for non-blocking sockets."""
+"""An I/O event loop for non-blocking sockets.
 
-import bisect
+Typical applications will use a single `IOLoop` object, in the
+`IOLoop.instance` singleton.  The `IOLoop.start` method should usually
+be called at the end of the ``main()`` function.  Atypical applications may
+use more than one `IOLoop`, such as one `IOLoop` per thread, or per `unittest`
+case.
+
+In addition to I/O events, the `IOLoop` can also schedule time-based events.
+`IOLoop.add_timeout` is a non-blocking alternative to `time.sleep`.
+"""
+
 import errno
+import heapq
 import os
 import logging
 import select
+import thread
 import time
 import traceback
 
@@ -31,24 +42,19 @@ try:
 except ImportError:
     signal = None
 
-try:
-    import fcntl
-except ImportError:
-    if os.name == 'nt':
-        from tornado import win32_support
-        from tornado import win32_support as fcntl
-    else:
-        raise
+from tornado.platform.auto import set_close_exec, Waker
+
 
 class IOLoop(object):
     """A level-triggered I/O loop.
 
-    We use epoll if it is available, or else we fall back on select(). If
-    you are implementing a system that needs to handle 1000s of simultaneous
-    connections, you should use Linux and either compile our epoll module or
-    use Python 2.6+ to get epoll support.
+    We use epoll (Linux) or kqueue (BSD and Mac OS X; requires python
+    2.6+) if they are available, or else we fall back on select(). If
+    you are implementing a system that needs to handle thousands of
+    simultaneous connections, you should use a system that supports either
+    epoll or queue.
 
-    Example usage for a simple TCP server:
+    Example usage for a simple TCP server::
 
         import errno
         import functools
@@ -97,29 +103,22 @@ class IOLoop(object):
     def __init__(self, impl=None):
         self._impl = impl or _poll()
         if hasattr(self._impl, 'fileno'):
-            self._set_close_exec(self._impl.fileno())
+            set_close_exec(self._impl.fileno())
         self._handlers = {}
         self._events = {}
-        self._callbacks = set()
+        self._callbacks = []
         self._timeouts = []
         self._running = False
         self._stopped = False
+        self._thread_ident = None
         self._blocking_signal_threshold = None
 
         # Create a pipe that we send bogus data to when we want to wake
         # the I/O loop when it is idle
-        if os.name != 'nt':
-            r, w = os.pipe()
-            self._set_nonblocking(r)
-            self._set_nonblocking(w)
-            self._set_close_exec(r)
-            self._set_close_exec(w)
-            self._waker_reader = os.fdopen(r, "rb", 0)
-            self._waker_writer = os.fdopen(w, "wb", 0)
-        else:
-            self._waker_reader = self._waker_writer = win32_support.Pipe()
-            r = self._waker_writer.reader_fd
-        self.add_handler(r, self._read_waker, self.READ)
+        self._waker = Waker()
+        self.add_handler(self._waker.fileno(),
+                         lambda fd, events: self._waker.consume(),
+                         self.READ)
 
     @classmethod
     def instance(cls):
@@ -131,7 +130,7 @@ class IOLoop(object):
 
         A common pattern for classes that depend on IOLoops is to use
         a default argument to enable programs with multiple IOLoops
-        but not require the argument for simpler applications:
+        but not require the argument for simpler applications::
 
             class MyClass(object):
                 def __init__(self, io_loop=None):
@@ -143,7 +142,24 @@ class IOLoop(object):
 
     @classmethod
     def initialized(cls):
+        """Returns true if the singleton instance has been created."""
         return hasattr(cls, "_instance")
+
+    def close(self, all_fds=False):
+        """Closes the IOLoop, freeing any resources used.
+
+        If ``all_fds`` is true, all file descriptors registered on the
+        IOLoop will be closed (not just the ones created by the IOLoop itself.
+        """
+        self.remove_handler(self._waker.fileno())
+        if all_fds:
+            for fd in self._handlers.keys()[:]:
+                try:
+                    os.close(fd)
+                except Exception:
+                    logging.debug("error closing fd %d", fd, exc_info=True)
+        self._waker.close()
+        self._impl.close()
 
     def add_handler(self, fd, handler, events):
         """Registers the given handler to receive the given events for fd."""
@@ -207,6 +223,7 @@ class IOLoop(object):
         if self._stopped:
             self._stopped = False
             return
+        self._thread_ident = thread.get_ident()
         self._running = True
         while True:
             # Never use an infinite timeout here - it can stall epoll
@@ -214,24 +231,29 @@ class IOLoop(object):
 
             # Prevent IO event starvation by delaying new callbacks
             # to the next iteration of the event loop.
-            callbacks = list(self._callbacks)
+            callbacks = self._callbacks
+            self._callbacks = []
             for callback in callbacks:
-                # A callback can add or remove other callbacks
-                if callback in self._callbacks:
-                    self._callbacks.remove(callback)
-                    self._run_callback(callback)
-
-            if self._callbacks:
-                poll_timeout = 0.0
+                self._run_callback(callback)
 
             if self._timeouts:
                 now = time.time()
-                while self._timeouts and self._timeouts[0].deadline <= now:
-                    timeout = self._timeouts.pop(0)
-                    self._run_callback(timeout.callback)
-                if self._timeouts:
-                    milliseconds = self._timeouts[0].deadline - now
-                    poll_timeout = min(milliseconds, poll_timeout)
+                while self._timeouts:
+                    if self._timeouts[0].callback is None:
+                        # the timeout was cancelled
+                        heapq.heappop(self._timeouts)
+                    elif self._timeouts[0].deadline <= now:
+                        timeout = heapq.heappop(self._timeouts)
+                        self._run_callback(timeout.callback)
+                    else:
+                        milliseconds = self._timeouts[0].deadline - now
+                        poll_timeout = min(milliseconds, poll_timeout)
+                        break
+
+            if self._callbacks:
+                # If any callbacks or timeouts called add_callback,
+                # we don't want to wait in poll() before we run them.
+                poll_timeout = 0.0
 
             if not self._running:
                 break
@@ -252,7 +274,6 @@ class IOLoop(object):
                 if (getattr(e, 'errno', None) == errno.EINTR or
                     (isinstance(getattr(e, 'args', None), tuple) and
                      len(e.args) == 2 and e.args[0] == errno.EINTR)):
-                    logging.warning("Interrupted system call", exc_info=1)
                     continue
                 else:
                     raise
@@ -270,8 +291,6 @@ class IOLoop(object):
                 fd, events = self._events.popitem()
                 try:
                     self._handlers[fd](fd, events)
-                except (KeyboardInterrupt, SystemExit):
-                    raise
                 except (OSError, IOError), e:
                     if e.args[0] == errno.EPIPE:
                         # Happens when the client closes the connection
@@ -279,7 +298,7 @@ class IOLoop(object):
                     else:
                         logging.error("Exception in I/O handler for fd %d",
                                       fd, exc_info=True)
-                except:
+                except Exception:
                     logging.error("Exception in I/O handler for fd %d",
                                   fd, exc_info=True)
         # reset the stopped flag so another start/stop pair can be issued
@@ -293,16 +312,18 @@ class IOLoop(object):
         will return immediately.
 
         To use asynchronous methods from otherwise-synchronous code (such as
-        unit tests), you can start and stop the event loop like this:
+        unit tests), you can start and stop the event loop like this::
+
           ioloop = IOLoop()
           async_method(ioloop=ioloop, callback=ioloop.stop)
           ioloop.start()
+
         ioloop.start() will return after async_method has run its callback,
         whether that callback was invoked before or after ioloop.start.
         """
         self._running = False
         self._stopped = True
-        self._wake()
+        self._waker.wake()
 
     def running(self):
         """Returns true if this IOLoop is currently running."""
@@ -314,7 +335,7 @@ class IOLoop(object):
         Returns a handle that may be passed to remove_timeout to cancel.
         """
         timeout = _Timeout(deadline, stack_context.wrap(callback))
-        bisect.insort(self._timeouts, timeout)
+        heapq.heappush(self._timeouts, timeout)
         return timeout
 
     def remove_timeout(self, timeout):
@@ -322,25 +343,30 @@ class IOLoop(object):
 
         The argument is a handle as returned by add_timeout.
         """
-        self._timeouts.remove(timeout)
+        # Removing from a heap is complicated, so just leave the defunct
+        # timeout object in the queue (see discussion in
+        # http://docs.python.org/library/heapq.html).
+        # If this turns out to be a problem, we could add a garbage
+        # collection pass whenever there are too many dead timeouts.
+        timeout.callback = None
 
     def add_callback(self, callback):
-        """Calls the given callback on the next I/O loop iteration."""
-        self._callbacks.add(stack_context.wrap(callback))
-        self._wake()
+        """Calls the given callback on the next I/O loop iteration.
 
-    def _wake(self):
-        try:
-            self._waker_writer.write("x")
-        except IOError:
-            pass
+        It is safe to call this method from any thread at any time.
+        Note that this is the *only* method in IOLoop that makes this
+        guarantee; all other interaction with the IOLoop must be done
+        from that IOLoop's thread.  add_callback() may be used to transfer
+        control from other threads to the IOLoop's thread.
+        """
+        if not self._callbacks and thread.get_ident() != self._thread_ident:
+            self._waker.wake()
+        self._callbacks.append(stack_context.wrap(callback))
 
     def _run_callback(self, callback):
         try:
             callback()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except:
+        except Exception:
             self.handle_callback_exception(callback)
 
     def handle_callback_exception(self, callback):
@@ -355,21 +381,6 @@ class IOLoop(object):
         """
         logging.error("Exception in callback %r", callback, exc_info=True)
 
-    def _read_waker(self, fd, events):
-        try:
-            while True:
-                self._waker_reader.read()
-        except IOError:
-            pass
-
-    def _set_nonblocking(self, fd):
-        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-    def _set_close_exec(self, fd):
-        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
-        fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
-
 
 class _Timeout(object):
     """An IOLoop timeout, a UNIX timestamp and a callback"""
@@ -381,15 +392,25 @@ class _Timeout(object):
         self.deadline = deadline
         self.callback = callback
 
-    def __cmp__(self, other):
-        return cmp((self.deadline, id(self.callback)),
-                   (other.deadline, id(other.callback)))
+    # Comparison methods to sort by deadline, with object id as a tiebreaker
+    # to guarantee a consistent ordering.  The heapq module uses __le__
+    # in python2.5, and __lt__ in 2.6+ (sort() and most other comparisons
+    # use __lt__).
+    def __lt__(self, other):
+        return ((self.deadline, id(self)) <
+                (other.deadline, id(other)))
+
+    def __le__(self, other):
+        return ((self.deadline, id(self)) <=
+                (other.deadline, id(other)))
 
 
 class PeriodicCallback(object):
     """Schedules the given callback to be called periodically.
 
     The callback is called every callback_time milliseconds.
+
+    `start` must be called after the PeriodicCallback is created.
     """
     def __init__(self, callback, callback_time, io_loop=None):
         self.callback = callback
@@ -398,20 +419,20 @@ class PeriodicCallback(object):
         self._running = False
 
     def start(self):
+        """Starts the timer."""
         self._running = True
         timeout = time.time() + self.callback_time / 1000.0
         self.io_loop.add_timeout(timeout, self._run)
 
     def stop(self):
+        """Stops the timer."""
         self._running = False
 
     def _run(self):
         if not self._running: return
         try:
             self.callback()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except:
+        except Exception:
             logging.error("Error in periodic callback", exc_info=True)
         if self._running:
             self.start()
@@ -428,6 +449,9 @@ class _EPoll(object):
 
     def fileno(self):
         return self._epoll_fd
+
+    def close(self):
+        os.close(self._epoll_fd)
 
     def register(self, fd, events):
         epoll.epoll_ctl(self._epoll_fd, self._EPOLL_CTL_ADD, fd, events)
@@ -450,6 +474,9 @@ class _KQueue(object):
 
     def fileno(self):
         return self._kqueue.fileno()
+
+    def close(self):
+        self._kqueue.close()
 
     def register(self, fd, events):
         self._control(fd, events, select.KQ_EV_ADD)
@@ -482,11 +509,20 @@ class _KQueue(object):
         events = {}
         for kevent in kevents:
             fd = kevent.ident
-            flags = 0
             if kevent.filter == select.KQ_FILTER_READ:
                 events[fd] = events.get(fd, 0) | IOLoop.READ
             if kevent.filter == select.KQ_FILTER_WRITE:
-                events[fd] = events.get(fd, 0) | IOLoop.WRITE
+                if kevent.flags & select.KQ_EV_EOF:
+                    # If an asynchronous connection is refused, kqueue
+                    # returns a write event with the EOF flag set.
+                    # Turn this into an error for consistency with the
+                    # other IOLoop implementations.
+                    # Note that for read events, EOF may be returned before
+                    # all data has been consumed from the socket buffer,
+                    # so we only check for EOF on write events.
+                    events[fd] = IOLoop.ERROR
+                else:
+                    events[fd] = events.get(fd, 0) | IOLoop.WRITE
             if kevent.flags & select.KQ_EV_ERROR:
                 events[fd] = events.get(fd, 0) | IOLoop.ERROR
         return events.items()
@@ -499,6 +535,9 @@ class _Select(object):
         self.write_fds = set()
         self.error_fds = set()
         self.fd_sets = (self.read_fds, self.write_fds, self.error_fds)
+
+    def close(self):
+        pass
 
     def register(self, fd, events):
         if events & IOLoop.READ: self.read_fds.add(fd)
@@ -545,7 +584,7 @@ else:
         # Linux systems with our C module installed
         import epoll
         _poll = _EPoll
-    except:
+    except Exception:
         # All other systems
         import sys
         if "linux" in sys.platform:
